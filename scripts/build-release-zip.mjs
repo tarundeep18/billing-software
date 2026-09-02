@@ -1,0 +1,183 @@
+#!/usr/bin/env node
+// build-release-zip.mjs — assembles the user-friendly release ZIP.
+//
+// Repo tree (developer-friendly): package.json / server.js / src /
+// scripts / … all at root, plus release-templates/ holding the
+// launcher files. This script combines them into a distributable
+// with the "one visible file" flat layout the user asked for:
+//
+//   Free-GST-Billing/
+//   ├── 🚀 Free GST Billing.hta
+//   ├── 🚀 Free GST Billing.command
+//   ├── 🚀 Free GST Billing.sh
+//   └── _system/
+//       ├── package.json
+//       ├── server.js
+//       ├── src/           (source, for parity with the dev repo)
+//       ├── dist/          (pre-built app so the user doesn't need `npm run build`)
+//       ├── scripts/
+//       ├── public/
+//       ├── README.md
+//       ├── LICENSE
+//       └── (all install/start/update/backup scripts flattened in)
+//
+// Usage:
+//   node scripts/build-release-zip.mjs
+//   node scripts/build-release-zip.mjs --outDir=./release-build
+//
+// Prerequisite: `npm run build` should have populated ./dist first.
+// This script will refuse to proceed if dist/ is missing so users
+// don't get a broken release.
+
+import { readdirSync, statSync, existsSync, mkdirSync, rmSync, copyFileSync, readFileSync } from 'fs';
+import { join, resolve, basename } from 'path';
+import { execSync } from 'child_process';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const REPO_ROOT = resolve(__filename, '..', '..');
+const outArg = process.argv.find(a => a.startsWith('--outDir='));
+const OUT_DIR = resolve(REPO_ROOT, outArg ? outArg.split('=')[1] : 'release-build');
+const STAGING = join(OUT_DIR, 'Free-GST-Billing');
+const SYSTEM = join(STAGING, '_system');
+
+console.log('\n  Free GST Billing — Release ZIP Builder\n');
+
+// --- Sanity checks ---
+const distPath = join(REPO_ROOT, 'dist');
+if (!existsSync(distPath)) {
+  console.error('  ❌ dist/ not found. Run `npm run build` first.');
+  process.exit(1);
+}
+const templates = join(REPO_ROOT, 'release-templates');
+if (!existsSync(templates)) {
+  console.error('  ❌ release-templates/ not found. Repo is missing files.');
+  process.exit(1);
+}
+const pkgJson = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8'));
+const version = pkgJson.version;
+
+// --- Clean staging area ---
+if (existsSync(OUT_DIR)) rmSync(OUT_DIR, { recursive: true, force: true });
+mkdirSync(SYSTEM, { recursive: true });
+
+// --- Copy launcher files to root of staging ---
+console.log('  → Copying launcher files…');
+for (const f of readdirSync(templates)) {
+  const src = join(templates, f);
+  if (statSync(src).isFile()) copyFileSync(src, join(STAGING, f));
+}
+
+// --- Copy _system-scripts contents INTO _system/ (flattened, no subfolder) ---
+console.log('  → Copying platform scripts into _system/…');
+const scriptsSrc = join(templates, '_system-scripts');
+
+// Windows PowerShell 5.1 reads a BOM-less .ps1 using the machine's ANSI
+// codepage, not UTF-8. A UTF-8 arrow or em dash then decodes into a curly
+// quote, and PowerShell treats curly quotes as real string delimiters -- so
+// the string terminates mid-line and the whole script dies with "The string
+// is missing the terminator". That shipped in v1.10.46 and broke Update,
+// Backup, Move and Start for every user. Keep these scripts pure ASCII; it
+// is the only encoding every codepage agrees on.
+function assertAsciiOnly(dir, files) {
+  const offenders = [];
+  for (const f of files) {
+    if (!/\.(ps1|bat|cmd)$/i.test(f)) continue;
+    readFileSync(join(dir, f), 'utf8')
+      .split('\n')
+      .forEach((line, i) => {
+        const hit = line.match(/[^\x00-\x7F]/g);
+        if (hit) offenders.push(`    ${f}:${i + 1}  ${[...new Set(hit)].join(' ')}`);
+      });
+  }
+  if (offenders.length) {
+    console.error('\n  x Non-ASCII characters found in Windows scripts:');
+    console.error(offenders.join('\n'));
+    console.error('\n    These break PowerShell 5.1 parsing. Use ASCII instead:');
+    console.error('    "-" for em dash, "..." for ellipsis, "->" for arrow.\n');
+    process.exit(1);
+  }
+}
+
+if (existsSync(scriptsSrc)) {
+  const scriptFiles = readdirSync(scriptsSrc);
+  assertAsciiOnly(scriptsSrc, scriptFiles);
+  for (const f of scriptFiles) {
+    copyFileSync(join(scriptsSrc, f), join(SYSTEM, f));
+  }
+}
+assertAsciiOnly(REPO_ROOT, readdirSync(REPO_ROOT));
+
+// --- Copy application build + runtime deps into _system/ ---
+// v1.10.44.1 — Ship only what the RUNTIME needs. Previously we
+// also copied `public/` (Vite source assets, ~15 MB of Tesseract
+// WASM) and `src/` (React source), doubling the ZIP size because
+// `dist/` already contains everything from `public/` (Vite copies
+// it during build). Users don't need the source — they have
+// dist/ (built app) + server.js + package.json. Postinstall
+// regenerates public/tesseract/ from node_modules on first
+// install if anything else needs it.
+console.log('  → Copying app build + runtime files into _system/…');
+const includeAtSystem = [
+  'package.json',
+  'package-lock.json',
+  'server.js',
+  'README.md',
+  'LICENSE',
+  'CHANGELOG.md',
+];
+for (const f of includeAtSystem) {
+  const src = join(REPO_ROOT, f);
+  if (existsSync(src)) copyFileSync(src, join(SYSTEM, f));
+}
+copyDirRecursive(join(REPO_ROOT, 'dist'), join(SYSTEM, 'dist'));
+// Only ship the scripts that postinstall / release-time need — not the
+// dev-only helpers (tax-test, discount-modes-test, generate-icons,
+// build-release-zip). Keeps ZIP lean and reduces attack surface.
+const runtimeScripts = ['bundle-tesseract-assets.mjs'];
+mkdirSync(join(SYSTEM, 'scripts'), { recursive: true });
+for (const s of runtimeScripts) {
+  const src = join(REPO_ROOT, 'scripts', s);
+  if (existsSync(src)) copyFileSync(src, join(SYSTEM, 'scripts', s));
+}
+
+// --- Create empty data folder so first-run doesn't need to mkdir ---
+mkdirSync(join(SYSTEM, 'data'), { recursive: true });
+
+// --- ZIP it up ---
+const zipName = `Free-GST-Billing-v${version}.zip`;
+const zipPath = join(OUT_DIR, zipName);
+console.log(`  → Creating ${zipName}…`);
+try {
+  if (process.platform === 'win32') {
+    // Use PowerShell's Compress-Archive; it ships with every Windows install.
+    execSync(`powershell -NoProfile -Command "Compress-Archive -Path '${STAGING}' -DestinationPath '${zipPath}' -Force"`, { stdio: 'inherit' });
+  } else {
+    // Use system zip if available (macOS + most Linux).
+    execSync(`cd "${OUT_DIR}" && zip -qr "${zipName}" "Free-GST-Billing"`, { stdio: 'inherit' });
+  }
+} catch (e) {
+  console.error('  ❌ Zip step failed:', e.message);
+  process.exit(1);
+}
+
+const sizeMB = (statSync(zipPath).size / 1024 / 1024).toFixed(2);
+console.log(`\n  ✅ Release built — ${sizeMB} MB`);
+console.log(`     ${zipPath}\n`);
+console.log('  Next steps:');
+console.log('   1. Test locally: extract the ZIP, double-click the launcher for your OS.');
+console.log('   2. Upload to GitHub Releases: gh release create v' + version + ' "' + zipPath + '"');
+console.log('   3. README download link already points at latest release — no code change needed.\n');
+
+function copyDirRecursive(src, dst) {
+  if (!existsSync(src)) return;
+  mkdirSync(dst, { recursive: true });
+  for (const entry of readdirSync(src, { withFileTypes: true })) {
+    const s = join(src, entry.name);
+    const d = join(dst, entry.name);
+    if (entry.name === 'node_modules') continue;   // never bundle
+    if (entry.name === '.git') continue;
+    if (entry.isDirectory()) copyDirRecursive(s, d);
+    else copyFileSync(s, d);
+  }
+}
