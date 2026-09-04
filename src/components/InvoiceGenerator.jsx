@@ -102,6 +102,7 @@ function RichEditor({ value, onChange, placeholder, toolbar = false }) {
       onChange(ref.current.innerHTML);
     }
   }, [onChange]);
+  
 
   // Toolbar formatting via document.execCommand. The existing innerHTML setters above
   // already wrap user content with DOMPurify.sanitize(), and the toolbar only emits
