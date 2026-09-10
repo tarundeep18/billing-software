@@ -1432,6 +1432,7 @@ export default function InvoiceGenerator({
     getAllProfiles()
       .then((p) => {
         setAllProfiles(p);
+        console.log("profiles",p);
         if (!activeProfile && p.length > 0) setActiveProfile(profileProp);
       })
       .catch(() => {});
